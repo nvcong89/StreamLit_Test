@@ -74,6 +74,50 @@ def get_chart_title(xls) -> tuple:
     return title, xlabel, ylabel
 
 
+def resolve_ship_image_path(image_name: str):
+    if not image_name:
+        return None
+
+    name = Path(image_name).name
+    search_roots = [BASE_DIR, BASE_DIR.parent, Path.cwd()]
+    candidate_paths = []
+
+    for root in search_roots:
+        if root is None:
+            continue
+        candidate_paths.extend([
+            root / "images" / name,
+            root / name,
+            root / "MooringForcePlotter" / "images" / name,
+            root / "MooringForcePlotter" / name,
+            root / "Plot_MooringForces" / "MooringForcePlotter" / "images" / name,
+            root / "Plot_MooringForces" / "MooringForcePlotter" / name,
+        ])
+
+    for root in search_roots:
+        if root is None or not root.exists():
+            continue
+        try:
+            for match in root.rglob(name):
+                if match.is_file():
+                    candidate_paths.append(match)
+        except Exception:
+            pass
+
+    seen = set()
+    for path in candidate_paths:
+        try:
+            if path.exists():
+                resolved = path.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    return resolved
+        except Exception:
+            continue
+
+    return None
+
+
 def get_ship_config(xls, sheet) -> dict:
     result = {"show": False, "image": None, "heading": 0.0}
     try:
@@ -84,26 +128,38 @@ def get_ship_config(xls, sheet) -> dict:
                 sheet_name = names[1]
             else:
                 sheet_name = names[0]
+
         raw = pd.read_excel(xls, sheet_name=sheet_name, header=None, usecols="I", nrows=3)
+
         if raw.empty or raw.shape[0] < 1:
             return result
+
         i1_val = str(raw.iloc[0, 0]).strip()
         if i1_val.lower() != "yes":
             return result
+
         result["show"] = True
+
         if raw.shape[0] >= 2:
             i2_val = str(raw.iloc[1, 0]).strip()
             if i2_val.lower() not in {"nan", "none", ""}:
-                image_path = BASE_DIR / "images" / i2_val
-                if image_path.exists():
+                image_path = resolve_ship_image_path(i2_val)
+                if image_path is not None:
                     result["image"] = image_path
+                    st.session_state["ship_debug"] = f"Resolved: {image_path}"
+                else:
+                    st.session_state["ship_debug"] = f"Missing image file: {i2_val}"
+
         if raw.shape[0] >= 3:
+            i3_val = raw.iloc[2, 0]
             try:
-                result["heading"] = float(raw.iloc[2, 0])
-            except Exception:
+                result["heading"] = float(i3_val)
+            except (ValueError, TypeError):
                 result["heading"] = 0.0
-    except Exception:
+    except Exception as exc:
+        st.session_state["ship_debug"] = f"Excel config error: {exc}"
         return result
+
     return result
 
 
@@ -141,17 +197,17 @@ def load_excel_data(uploaded_file, sheet_name: str | int, wind_col: str):
 def load_ship_image(image_path: Path, heading_deg: float, zoom: float):
     if image_path is None or not image_path.exists():
         return None
+
     try:
         from scipy.ndimage import rotate as scipy_rotate
         img = mpimg.imread(str(image_path))
         rotated = scipy_rotate(img, angle=-heading_deg, reshape=True)
         return OffsetImage(rotated, zoom=zoom)
+    except ImportError:
+        img = mpimg.imread(str(image_path))
+        return OffsetImage(img, zoom=zoom)
     except Exception:
-        try:
-            img = mpimg.imread(str(image_path))
-            return OffsetImage(img, zoom=zoom)
-        except Exception:
-            return None
+        return None
 
 
 def create_line_chart(wind_dir, data, title, xlabel, ylabel):
@@ -174,22 +230,42 @@ def create_line_chart(wind_dir, data, title, xlabel, ylabel):
 def create_polar_chart(wind_dir, data, title, xlabel, ship_cfg):
     colors, _ = get_style(len(data))
     angles = np.radians(wind_dir + [wind_dir[0]])
+
     fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(projection='polar'))
     ax.set_theta_zero_location('N')
     ax.set_theta_direction(-1)
+
     for (label, values), color in zip(data.items(), colors):
         vals = values + [values[0]]
         ax.plot(angles, vals, label=label, color=color, linewidth=2)
         ax.fill(angles, vals, alpha=0.05, color=color)
+
     ax.set_thetagrids(wind_dir, labels=[f'{d}°' for d in wind_dir], fontsize=9)
     ax.set_title(title or 'Mooring Force', fontsize=14, fontweight='bold', pad=20)
     legend_title = xlabel if xlabel else 'Mooring Point'
     ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1), fontsize=10, title=legend_title)
+
     if ship_cfg.get("show") and ship_cfg.get("image") is not None:
-        imagebox = load_ship_image(ship_cfg['image'], ship_cfg.get('heading', 0.0), SHIP_ZOOM)
+        imagebox = load_ship_image(
+            ship_cfg["image"],
+            ship_cfg.get("heading", 0.0),
+            0.18
+        )
         if imagebox is not None:
-            ab = AnnotationBbox(imagebox, xy=(0, 0), xycoords='data', frameon=False, box_alignment=(0.5, 0.5))
+            ab = AnnotationBbox(
+                imagebox,
+                xy=(0, 0),
+                xycoords='data',
+                frameon=False,
+                box_alignment=(0.5, 0.5),
+                annotation_clip=False,
+            )
+            ab.set_zorder(20)
             ax.add_artist(ab)
+            st.session_state["ship_debug"] = f"Loaded: {ship_cfg['image']}"
+        else:
+            st.session_state["ship_debug"] = f"Failed to load: {ship_cfg['image']}"
+
     return fig
 
 
@@ -237,6 +313,8 @@ except Exception as e:
     st.stop()
 
 st.success(f"Đã đọc được {len(wind_dir)} điểm dữ liệu từ sheet '{sheet_name}'.")
+if "ship_debug" in st.session_state:
+    st.caption(st.session_state["ship_debug"])
 
 col1, col2 = st.columns([1.2, 1])
 with col1:
